@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import os
 import queue
-import pickle
 import threading
 import traceback
 
@@ -28,11 +27,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from Logic import (
     FS,
     IDENTIFY_THRESHOLD,
-    SEGMENT_LEN,
-    generate_demo_ecg,
     identify_subject,
     load_csv_signal,
-    load_dataset,
     preprocess_signal,
     extract_heartbeats,
     extract_features,
@@ -45,7 +41,6 @@ from Logic import (
 
 DATA_ROOT = r"C:\Users\Mohamed\Desktop\HCI\PDB_csv"
 PHOTOS_DIR = r"photos"
-RESULTS_DIR = r"ecg_results"
 SUBJECT_IDS = ["s0001", "s0002", "s0003", "s0004", "s0005"]
 HAS_HEADER = True
 TARGET_COLUMN = None
@@ -90,7 +85,6 @@ STATE = {
     "msg_queue": queue.Queue(),
     "photo_refs": [],
     "photos_dir": PHOTOS_DIR,
-    "results_dir": RESULTS_DIR,
     "data_root": DATA_ROOT,
     "has_header": HAS_HEADER,
     "target_column": TARGET_COLUMN,
@@ -223,65 +217,12 @@ def refresh_results_table(rows):
 
 
 # =============================================================================
-# CACHED MODEL
-# =============================================================================
-
-def try_load_cached_model():
-    model_path = os.path.join(STATE["results_dir"], "models", "best_model.pkl")
-    meta_path = os.path.join(STATE["results_dir"], "models", "meta.pkl")
-    if not (os.path.exists(model_path) and os.path.exists(meta_path)):
-        log("No cached model found. Use TRAINING tab.")
-        return
-    try:
-        with open(model_path, "rb") as f:
-            obj = pickle.load(f)
-        STATE["clf"] = obj["clf"]
-        STATE["scaler"] = obj["scaler"]
-        with open(meta_path, "rb") as f:
-            STATE["meta"] = pickle.load(f)
-        STATE["subject_ids"] = STATE["meta"]["patient_ids"]
-        acc = STATE["meta"]["accuracy"]
-        STATE["wavelet"] = STATE["meta"].get("best_wavelet", "db1")
-        set_mode(f"[ MODEL OK  acc={acc:.2%} ]", SUCCESS)
-        log(f"Model loaded: {STATE['meta']['best_clf']} [{STATE['meta']['best_param']}] acc={acc:.4f}")
-        refresh_subject_list()
-        refresh_gallery()
-        refresh_results_table(STATE["meta"].get("all_results_summary", []))
-        UI["best_var"].set(f"Best: {STATE['meta']['best_clf']} [{STATE['meta']['best_param']}] | Acc={acc:.2%}")
-    except Exception as e:
-        log(f"[ERROR] {e}")
-
-
-# =============================================================================
 # TRAINING
 # =============================================================================
 
 def start_training():
     if STATE["training"]:
         return
-
-    STATE["data_root"] = UI["data_root_var"].get().strip()
-    STATE["photos_dir"] = UI["photos_dir_var"].get().strip()
-    STATE["results_dir"] = UI["results_dir_var"].get().strip()
-    STATE["fs"] = int(UI["fs_var"].get().strip())
-
-    raw_ids = [s.strip() for s in UI["subjects_var"].get().split(",") if s.strip()]
-    if len(raw_ids) < 2:
-        messagebox.showerror("Config error", "Please enter at least 2 subject IDs.")
-        return
-    STATE["subject_ids"] = raw_ids
-
-    col_value = UI["column_var"].get().strip()
-    if col_value.lower() in ("auto", ""):
-        STATE["target_column"] = None
-        STATE["target_column_index"] = None
-    else:
-        if col_value.isdigit():
-            STATE["target_column_index"] = int(col_value)
-            STATE["target_column"] = None
-        else:
-            STATE["target_column"] = col_value
-            STATE["target_column_index"] = None
 
     refresh_subject_list()
     refresh_gallery()
@@ -290,23 +231,32 @@ def start_training():
     box.configure(state="normal")
     box.delete("1.0", "end")
     box.configure(state="disabled")
+
     refresh_results_table([])
 
     STATE["training"] = True
-    UI["train_btn"].configure(state="disabled", text="[ TRAINING… ]")
+
+    UI["train_btn"].configure(
+        state="disabled",
+        text="[ TRAINING… ]"
+    )
+
     set_mode("[ TRAINING… ]", WARN)
 
-    t = threading.Thread(target=train_worker, daemon=True)
-    t.start()
-    STATE["root"].after(120, poll_messages)
+    t = threading.Thread(
+        target=train_worker,
+        daemon=True
+    )
 
+    t.start()
+
+    STATE["root"].after(120, poll_messages)
 
 def train_worker():
     try:
         _, df, meta = run_full_training(
             STATE["data_root"],
             STATE["subject_ids"],
-            STATE["results_dir"],
             has_header=STATE["has_header"],
             target_column=STATE["target_column"],
             target_column_index=STATE["target_column_index"],
@@ -324,7 +274,7 @@ def train_worker():
 
 def load_ecg_file():
     if STATE["clf"] is None:
-        messagebox.showwarning("No model", "Please train or load a model first.")
+        messagebox.showwarning("No model", "Please train a model first.")
         return
     path = filedialog.askopenfilename(
         title="Select ECG CSV file",
@@ -334,15 +284,7 @@ def load_ecg_file():
         start_scan(csv_path=path)
 
 
-def run_demo_scan():
-    if STATE["clf"] is None:
-        messagebox.showwarning("No model", "Please train or load a model first.")
-        return
-    idx = np.random.randint(0, len(STATE["subject_ids"]))
-    start_scan(demo_subject=idx)
-
-
-def start_scan(csv_path=None, demo_subject=None):
+def start_scan(csv_path=None):
     if STATE["scanning"]:
         return
     STATE["scanning"] = True
@@ -351,24 +293,21 @@ def start_scan(csv_path=None, demo_subject=None):
     UI["conf_var"].set("")
     UI["progress"]["value"] = 0
     UI["scan_status"].set("Starting scan…")
-    t = threading.Thread(target=scan_worker, args=(csv_path, demo_subject), daemon=True)
+    t = threading.Thread(target=scan_worker, args=(csv_path,), daemon=True)
     t.start()
     STATE["root"].after(120, poll_messages)
 
 
-def scan_worker(csv_path, demo_subject):
+def scan_worker(csv_path):
     q = STATE["msg_queue"]
     try:
         q.put(("scan_prog", 10, "Loading ECG signal…"))
-        if demo_subject is not None:
-            sig = generate_demo_ecg(demo_subject, n_seconds=10, fs=STATE["fs"])
-        else:
-            sig = load_csv_signal(
-                csv_path,
-                has_header=STATE["has_header"],
-                target_column=STATE["target_column"],
-                target_column_index=STATE["target_column_index"],
-            )
+        sig = load_csv_signal(
+            csv_path,
+            has_header=STATE["has_header"],
+            target_column=STATE["target_column"],
+            target_column_index=STATE["target_column_index"],
+        )
 
         q.put(("scan_prog", 30, "Preprocessing…"))
         processed = preprocess_signal(sig, fs=STATE["fs"])
@@ -383,9 +322,6 @@ def scan_worker(csv_path, demo_subject):
         wavelet_name = STATE["meta"].get("best_wavelet", "db1") if STATE["meta"] else "db1"
         q.put(("scan_prog", 70, f"Extracting wavelet features ({wavelet_name})…"))
         feats = extract_features(beats, wavelet=wavelet_name)
-
-        if demo_subject is not None:
-            feats[:, :5] += demo_subject * 0.6
 
         q.put(("scan_prog", 88, "Classifying…"))
         name, conf = identify_subject(feats, STATE["clf"], STATE["scaler"], STATE["subject_ids"], threshold=IDENTIFY_THRESHOLD)
@@ -414,8 +350,16 @@ def poll_messages():
                 _, df, meta = msg
                 STATE["training"] = False
                 UI["train_btn"].configure(state="normal", text="[ START TRAINING ]")
-                try_load_cached_model()
+                STATE["meta"] = meta
+                STATE["clf"] = meta["clf"]
+                STATE["scaler"] = meta["scaler"]
+                STATE["wavelet"] = meta.get("best_wavelet", "db1")
+                set_mode(f"[ MODEL OK  acc={meta['accuracy']:.2%} ]", SUCCESS)
+                log(f"Model ready: {meta['best_clf']} [{meta['best_param']}] acc={meta['accuracy']:.4f}")
+                refresh_subject_list()
+                refresh_gallery()
                 refresh_results_table(df.to_dict("records"))
+                UI["best_var"].set(f"Best: {meta['best_clf']} [{meta['best_param']}] | Acc={meta['accuracy']:.2%}")
 
             elif kind == "train_error":
                 STATE["training"] = False
@@ -515,7 +459,6 @@ def build_ui(root):
     root.geometry("1200x820")
     root.minsize(900, 700)
 
-    os.makedirs(STATE["results_dir"], exist_ok=True)
     os.makedirs(STATE["photos_dir"], exist_ok=True)
 
     hdr = tk.Frame(root, bg=BG, height=70)
@@ -543,7 +486,6 @@ def build_ui(root):
     right.pack(side="left", fill="both", expand=True)
     build_right(right)
 
-    try_load_cached_model()
     animate_cursor()
 
 
@@ -619,7 +561,6 @@ def build_scanner_tab(parent):
         return b
 
     btn(parent, "[ LOAD ECG CSV ]", load_ecg_file)
-    btn(parent, "[ DEMO SCAN ]", run_demo_scan)
     btn(parent, "[ LOCK ALL PHOTOS ]", lock_all, fg=DANGER)
 
     tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", padx=12, pady=8)
@@ -631,59 +572,72 @@ def build_scanner_tab(parent):
 
 
 def build_training_tab(parent):
-    tk.Label(parent, text="DATA CONFIGURATION", bg=PANEL, fg=ACCENT, font=FNT_H2).pack(anchor="w", padx=12, pady=(12, 2))
 
-    def lrow(p, label, var, browse_cmd=None):
-        row = tk.Frame(p, bg=PANEL)
-        row.pack(fill="x", padx=10, pady=2)
-        tk.Label(row, text=label, bg=PANEL, fg=TEXT_DIM, font=FNT_SMALL, width=14, anchor="e").pack(side="left")
-        e = tk.Entry(row, textvariable=var, bg=CARD, fg=TEXT, font=FNT_MONO, insertbackground=ACCENT, relief="flat", bd=4)
-        e.pack(side="left", fill="x", expand=True, padx=(4, 2))
-        if browse_cmd:
-            tk.Button(row, text="…", command=browse_cmd, bg=BORDER, fg=ACCENT, font=FNT_MONO,
-                      relief="flat", cursor="hand2", padx=6, bd=0).pack(side="left")
+    tk.Label(
+        parent,
+        text="TRAINING",
+        bg=PANEL,
+        fg=ACCENT,
+        font=FNT_H2
+    ).pack(anchor="w", padx=12, pady=(12, 2))
 
-    data_root_var = tk.StringVar(value=STATE["data_root"])
-    photos_dir_var = tk.StringVar(value=STATE["photos_dir"])
-    results_dir_var = tk.StringVar(value=STATE["results_dir"])
-    subjects_var = tk.StringVar(value=", ".join(STATE["subject_ids"]))
-    column_var = tk.StringVar(value="Auto")
-    fs_var = tk.StringVar(value=str(STATE["fs"]))
+    tk.Frame(parent, bg=BORDER, height=1).pack(
+        fill="x",
+        padx=12,
+        pady=6
+    )
 
-    UI["data_root_var"] = data_root_var
-    UI["photos_dir_var"] = photos_dir_var
-    UI["results_dir_var"] = results_dir_var
-    UI["subjects_var"] = subjects_var
-    UI["column_var"] = column_var
-    UI["fs_var"] = fs_var
+    train_btn = tk.Button(
+        parent,
+        text="[ START TRAINING ]",
+        command=start_training,
+        bg=ACCENT2,
+        fg="white",
+        font=FNT_H2,
+        activebackground=ACCENT,
+        activeforeground=BG,
+        relief="flat",
+        cursor="hand2",
+        pady=8,
+        bd=0
+    )
 
-    lrow(parent, "CSV root:", data_root_var,
-         lambda: data_root_var.set(filedialog.askdirectory(title="Select ECG CSV root") or data_root_var.get()))
-    lrow(parent, "Photos dir:", photos_dir_var,
-         lambda: photos_dir_var.set(filedialog.askdirectory(title="Select photos folder") or photos_dir_var.get()))
-    lrow(parent, "Results dir:", results_dir_var)
-    lrow(parent, "Subjects:", subjects_var)
-    lrow(parent, "Column:", column_var)
-    lrow(parent, "Sampling rate:", fs_var)
+    train_btn.pack(
+        fill="x",
+        padx=12,
+        pady=4
+    )
 
-    tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", padx=12, pady=6)
-
-    train_btn = tk.Button(parent, text="[ START TRAINING ]", command=start_training,
-                          bg=ACCENT2, fg="white", font=FNT_H2, activebackground=ACCENT,
-                          activeforeground=BG, relief="flat", cursor="hand2", pady=8, bd=0)
-    train_btn.pack(fill="x", padx=12, pady=4)
     UI["train_btn"] = train_btn
 
-    tk.Button(parent, text="[ LOAD CACHED MODEL ]", command=try_load_cached_model,
-              bg=BORDER, fg=ACCENT, font=FNT_MONO, activebackground=ACCENT2,
-              activeforeground="white", relief="flat", cursor="hand2", pady=6, bd=0).pack(fill="x", padx=12, pady=2)
+    tk.Label(
+        parent,
+        text="TRAINING LOG",
+        bg=PANEL,
+        fg=TEXT_DIM,
+        font=FNT_MONO
+    ).pack(anchor="w", padx=12, pady=(8, 0))
 
-    tk.Label(parent, text="TRAINING LOG", bg=PANEL, fg=TEXT_DIM, font=FNT_MONO).pack(anchor="w", padx=12, pady=(8, 0))
-    log_box = scrolledtext.ScrolledText(parent, bg="#0D1520", fg=SUCCESS, font=("Courier New", 8),
-                                        insertbackground=ACCENT, relief="flat", bd=4, height=12, state="disabled")
-    log_box.pack(fill="both", expand=True, padx=10, pady=(2, 8))
+    log_box = scrolledtext.ScrolledText(
+        parent,
+        bg="#0D1520",
+        fg=SUCCESS,
+        font=("Courier New", 8),
+        insertbackground=ACCENT,
+        relief="flat",
+        bd=4,
+        height=18,
+        state="disabled"
+    )
+
+    log_box.pack(
+        fill="both",
+        expand=True,
+        padx=10,
+        pady=(2, 8)
+    )
+
     UI["log_box"] = log_box
-
 
 def build_results_tab(parent):
     tk.Label(parent, text="ACCURACY TABLE", bg=PANEL, fg=ACCENT, font=FNT_H2).pack(anchor="w", padx=12, pady=(12, 4))

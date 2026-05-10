@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import pickle
 import warnings
 from typing import Dict, List, Optional, Tuple
 
@@ -49,16 +48,6 @@ def preprocess_signal(raw, fs=FS):
 
 
 def detect_rpeaks(sig, fs=FS):
-    """Try neurokit2 first; otherwise use a simple fallback detector."""
-    try:
-        import neurokit2 as nk
-        _, info = nk.ecg_peaks(sig, sampling_rate=fs, method="pantompkins1985")
-        r = np.asarray(info.get("ECG_R_Peaks", []), dtype=int)
-        if len(r) > 0:
-            return r
-    except Exception:
-        pass
-
     diff = np.diff(sig, prepend=sig[0])
     squared = diff ** 2
     win = max(1, int(0.15 * fs))
@@ -76,14 +65,10 @@ def extract_heartbeats(sig, fs=FS):
         end = r + SEG_AFTER
         if start >= 0 and end <= len(sig):
             beats.append(sig[start:end])
-    if beats:
-        return np.asarray(beats)
-    return np.empty((0, SEGMENT_LEN))
+    return np.asarray(beats)
 
 
-# =============================================================================
-# CSV LOADING
-# =============================================================================
+# file processing
 
 def infer_numeric_columns(df):
     cols = []
@@ -103,10 +88,6 @@ def load_csv_signal(file_path, has_header=True, target_column: Optional[str] = N
     if target_column_index is not None and 0 <= target_column_index < df.shape[1]:
         return df.iloc[:, target_column_index].to_numpy(dtype=float)
 
-    numeric_cols = infer_numeric_columns(df)
-    if numeric_cols:
-        return df[numeric_cols[0]].to_numpy(dtype=float)
-
     best_col = None
     best_non_nan = -1
     for c in df.columns:
@@ -116,24 +97,12 @@ def load_csv_signal(file_path, has_header=True, target_column: Optional[str] = N
             best_non_nan = count
             best_col = c
 
-    if best_col is None:
-        raise ValueError(f"No usable numeric column found in {file_path}")
-
-    return (
-        pd.to_numeric(df[best_col], errors="coerce")
-        .ffill()
-        .bfill()
-        .to_numpy(dtype=float)
-    )
+    return (pd.to_numeric(df[best_col], errors="coerce").ffill().bfill().to_numpy(dtype=float))
 
 
-def list_subject_files(data_root: str, subject_id: str) -> List[str]:
-    if not os.path.isdir(data_root):
-        return []
+def list_subject_files(data_root: str, subject_id: str):
     out = []
     for fname in sorted(os.listdir(data_root)):
-        if not fname.lower().endswith(".csv"):
-            continue
         if os.path.splitext(fname)[0].startswith(subject_id):
             out.append(os.path.join(data_root, fname))
     return out
@@ -147,25 +116,18 @@ def load_subject_beats(data_root, subject_id, max_files: Optional[int] = None, h
         files = files[:max_files]
 
     for file_path in files:
-        try:
-            raw = load_csv_signal(
-                file_path,
-                has_header=has_header,
-                target_column=target_column,
-                target_column_index=target_column_index,
-            )
-            if len(raw) < SEGMENT_LEN:
-                continue
-            processed = preprocess_signal(raw, fs=fs)
-            beats = extract_heartbeats(processed, fs=fs)
-            if beats.shape[0] > 0:
-                all_beats.append(beats)
-        except Exception as e:
-            print(f"[WARN] {file_path}: {e}")
+        raw = load_csv_signal(
+            file_path,
+            has_header=has_header,
+            target_column=target_column,
+            target_column_index=target_column_index,
+        )
+        processed = preprocess_signal(raw, fs=fs)
+        beats = extract_heartbeats(processed, fs=fs)
+        if beats.shape[0] > 0:
+            all_beats.append(beats)
 
-    if all_beats:
-        return np.vstack(all_beats)
-    return np.empty((0, SEGMENT_LEN))
+    return np.vstack(all_beats)
 
 
 def load_dataset(data_root, subject_ids, max_files_per_subject: Optional[int] = None, has_header=True,
@@ -186,21 +148,15 @@ def load_dataset(data_root, subject_ids, max_files_per_subject: Optional[int] = 
         if beats.shape[0] > 0:
             X_list.append(beats)
             y_list.extend([label] * beats.shape[0])
-    if X_list:
-        return np.vstack(X_list), np.asarray(y_list, dtype=int)
-    return np.empty((0, SEGMENT_LEN)), np.asarray([], dtype=int)
+    return np.vstack(X_list), np.asarray(y_list, dtype=int)
 
 
-# =============================================================================
-# FEATURE EXTRACTION
-# =============================================================================
+# feature extraction
 
 def wavelet_features_single(segment, wavelet="db1", level=WAVELET_LEVEL):
     coeffs = pywt.wavedec(segment, wavelet, level=level)
     feats = []
     for c in coeffs:
-        if len(c) == 0:
-            continue
         feats.extend([
             float(np.mean(c)),
             float(np.std(c)),
@@ -226,9 +182,7 @@ def extract_all_wavelets(X, log_fn=print):
     return out
 
 
-# =============================================================================
-# CLASSIFIERS
-# =============================================================================
+# classification
 
 def get_classifiers():
     return {
@@ -293,16 +247,11 @@ def identify_subject(beats_features, clf, scaler, subject_ids, threshold=IDENTIF
     return "Unknown", confidence
 
 
-# =============================================================================
-# TRAINING / SAVING
-# =============================================================================
+# train
 
-def run_full_training(data_root, subject_ids, results_dir, max_files_per_subject: Optional[int] = None, has_header=True,
+def run_full_training(data_root, subject_ids, max_files_per_subject: Optional[int] = None, has_header=True,
                       target_column: Optional[str] = None, target_column_index: Optional[int] = None, fs=FS,
                       log_fn=print):
-    os.makedirs(results_dir, exist_ok=True)
-    os.makedirs(os.path.join(results_dir, "models"), exist_ok=True)
-
     log_fn("[1/4] Loading dataset")
     X, y = load_dataset(
         data_root,
@@ -314,9 +263,6 @@ def run_full_training(data_root, subject_ids, results_dir, max_files_per_subject
         fs=fs,
         log_fn=log_fn,
     )
-    if X.shape[0] == 0:
-        raise RuntimeError("No ECG beats loaded. Check DATA_ROOT, SUBJECT_IDS and column selection.")
-
     log_fn(f"Total beats = {X.shape[0]}")
     log_fn("[2/4] Extracting wavelet features")
     wavelet_features = extract_all_wavelets(X, log_fn=log_fn)
@@ -344,46 +290,20 @@ def run_full_training(data_root, subject_ids, results_dir, max_files_per_subject
                     best_model_info = (wv, clf_name, param, info)
 
     df = pd.DataFrame(rows).sort_values(["Wavelet", "Accuracy (%)"], ascending=[True, False])
-    df.to_csv(os.path.join(results_dir, "results_table.csv"), index=False)
 
     wv_best, clf_best, param_best, best_info = best_model_info
-    with open(os.path.join(results_dir, "models", "best_model.pkl"), "wb") as f:
-        pickle.dump({"clf": best_info["clf"], "scaler": best_info["scaler"]}, f)
-    with open(os.path.join(results_dir, "models", "meta.pkl"), "wb") as f:
-        pickle.dump({
-            "patient_ids": subject_ids,
-            "best_wavelet": wv_best,
-            "best_clf": clf_best,
-            "best_param": param_best,
-            "accuracy": best_acc,
-            "all_results_summary": df.to_dict("records"),
-        }, f)
-    with open(os.path.join(results_dir, "models", "features_cache.pkl"), "wb") as f:
-        pickle.dump({"wavelet_features": wavelet_features, "y": y, "patient_ids": subject_ids}, f)
 
-    log_fn("[4/4] Saved results and model")
+    log_fn("[4/4] Training finished")
     return all_results, df, {
         "patient_ids": subject_ids,
         "best_wavelet": wv_best,
         "best_clf": clf_best,
         "best_param": param_best,
         "accuracy": best_acc,
+        "clf": best_info["clf"],
+        "scaler": best_info["scaler"],
+        "all_results_summary": df.to_dict("records"),
     }
-
-
-def generate_demo_ecg(subject_idx, n_seconds=10, fs=FS):
-    t = np.linspace(0, n_seconds, fs * n_seconds)
-    hr = 60 + subject_idx * 5
-    interval = 60.0 / hr
-    sig = np.zeros_like(t)
-    for bt in np.arange(0, n_seconds, interval):
-        c = bt + 0.04 * np.random.randn()
-        sig += 1.2 * np.exp(-((t - c) ** 2) / (2 * 0.005 ** 2))
-        sig += 0.2 * np.exp(-((t - (c - 0.06)) ** 2) / (2 * 0.010 ** 2))
-        sig += -0.3 * np.exp(-((t - (c + 0.04)) ** 2) / (2 * 0.008 ** 2))
-        sig += 0.3 * np.exp(-((t - (c + 0.15)) ** 2) / (2 * 0.020 ** 2))
-    sig += 0.02 * np.random.randn(len(t))
-    return sig
 
 
 def main():
