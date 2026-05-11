@@ -20,19 +20,22 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 from PIL import Image, ImageTk, ImageDraw
 
 import matplotlib
+
 matplotlib.use("TkAgg")
+from Logic import MODEL_STATE
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from Logic import (
+    predict_subject_from_file,
+    MODEL_STATE,
     FS,
     IDENTIFY_THRESHOLD,
-    identify_subject,
     load_csv_signal,
     preprocess_signal,
     extract_heartbeats,
     extract_features,
-    run_full_training,
+    run_full_training, identify_subject,
 )
 
 # =============================================================================
@@ -84,6 +87,7 @@ STATE = {
     "training": False,
     "msg_queue": queue.Queue(),
     "photo_refs": [],
+    "results_dir": "results",
     "photos_dir": PHOTOS_DIR,
     "data_root": DATA_ROOT,
     "has_header": HAS_HEADER,
@@ -223,47 +227,36 @@ def refresh_results_table(rows):
 def start_training():
     if STATE["training"]:
         return
-
     refresh_subject_list()
     refresh_gallery()
-
     box = UI["log_box"]
     box.configure(state="normal")
     box.delete("1.0", "end")
     box.configure(state="disabled")
-
     refresh_results_table([])
-
     STATE["training"] = True
-
     UI["train_btn"].configure(
         state="disabled",
         text="[ TRAINING… ]"
     )
-
     set_mode("[ TRAINING… ]", WARN)
-
     t = threading.Thread(
         target=train_worker,
         daemon=True
     )
-
     t.start()
-
     STATE["root"].after(120, poll_messages)
+
 
 def train_worker():
     try:
-        _, df, meta = run_full_training(
+        df = run_full_training(
             STATE["data_root"],
             STATE["subject_ids"],
-            has_header=STATE["has_header"],
-            target_column=STATE["target_column"],
-            target_column_index=STATE["target_column_index"],
             fs=STATE["fs"],
             log_fn=lambda msg: STATE["msg_queue"].put(("log", msg)),
         )
-        STATE["msg_queue"].put(("train_done", df, meta))
+        STATE["msg_queue"].put(("train_done", df))
     except Exception:
         STATE["msg_queue"].put(("train_error", traceback.format_exc()))
 
@@ -273,7 +266,7 @@ def train_worker():
 # =============================================================================
 
 def load_ecg_file():
-    if STATE["clf"] is None:
+    if MODEL_STATE["clf"] is None:
         messagebox.showwarning("No model", "Please train a model first.")
         return
     path = filedialog.askopenfilename(
@@ -302,31 +295,22 @@ def scan_worker(csv_path):
     q = STATE["msg_queue"]
     try:
         q.put(("scan_prog", 10, "Loading ECG signal…"))
-        sig = load_csv_signal(
-            csv_path,
-            has_header=STATE["has_header"],
-            target_column=STATE["target_column"],
-            target_column_index=STATE["target_column_index"],
-        )
-
         q.put(("scan_prog", 30, "Preprocessing…"))
-        processed = preprocess_signal(sig, fs=STATE["fs"])
-        q.put(("ecg_plot", processed[:3000]))
-
         q.put(("scan_prog", 50, "Detecting R-peaks and segmenting…"))
-        beats = extract_heartbeats(processed, fs=STATE["fs"])
-        if beats.shape[0] < 3:
-            q.put(("scan_error", f"Only {beats.shape[0]} beats detected. Try another file or adjust FS/column selection."))
-            return
-
-        wavelet_name = STATE["meta"].get("best_wavelet", "db1") if STATE["meta"] else "db1"
-        q.put(("scan_prog", 70, f"Extracting wavelet features ({wavelet_name})…"))
-        feats = extract_features(beats, wavelet=wavelet_name)
-
+        q.put(("scan_prog", 70, "Extracting features…"))
         q.put(("scan_prog", 88, "Classifying…"))
-        name, conf = identify_subject(feats, STATE["clf"], STATE["scaler"], STATE["subject_ids"], threshold=IDENTIFY_THRESHOLD)
+        result = predict_subject_from_file(
+            csv_path,
+            fs=STATE["fs"]
+        )
+        q.put(("ecg_plot", result["signal"][:3000]))
         q.put(("scan_prog", 100, "Done."))
-        q.put(("scan_result", name, conf, beats.shape[0]))
+        q.put((
+            "scan_result",
+            result["name"],
+            result["confidence"],
+            result["beats"].shape[0]
+        ))
     except Exception:
         q.put(("scan_error", traceback.format_exc()))
 
@@ -341,25 +325,29 @@ def poll_messages():
         while True:
             msg = STATE["msg_queue"].get_nowait()
             kind = msg[0]
-
             if kind == "log":
                 log(msg[1])
                 still_busy = True
-
             elif kind == "train_done":
-                _, df, meta = msg
+                _, df = msg
                 STATE["training"] = False
                 UI["train_btn"].configure(state="normal", text="[ START TRAINING ]")
-                STATE["meta"] = meta
-                STATE["clf"] = meta["clf"]
-                STATE["scaler"] = meta["scaler"]
-                STATE["wavelet"] = meta.get("best_wavelet", "db1")
-                set_mode(f"[ MODEL OK  acc={meta['accuracy']:.2%} ]", SUCCESS)
-                log(f"Model ready: {meta['best_clf']} [{meta['best_param']}] acc={meta['accuracy']:.4f}")
+                best_row = df.loc[df["Accuracy (%)"].idxmax()]
+                set_mode(f"[ MODEL OK  acc={best_row['Accuracy (%)']:.2f}% ]", SUCCESS)
+                log(f"Model ready: "
+                    f"{best_row['Classifier']} "
+                    f"[{best_row['Parameters']}] "
+                    f"acc={best_row['Accuracy (%)']:.2f}%"
+                    )
                 refresh_subject_list()
                 refresh_gallery()
                 refresh_results_table(df.to_dict("records"))
-                UI["best_var"].set(f"Best: {meta['best_clf']} [{meta['best_param']}] | Acc={meta['accuracy']:.2%}")
+                UI["best_var"].set(
+                    f"Best: "
+                    f"{best_row['Classifier']} "
+                    f"[{best_row['Parameters']}] "
+                    f"| Acc={best_row['Accuracy (%)']:.2f}%"
+                )
 
             elif kind == "train_error":
                 STATE["training"] = False
@@ -389,12 +377,12 @@ def poll_messages():
                 if name == "Unknown":
                     UI["result_var"].set("UNKNOWN")
                     UI["result_lbl"].configure(fg=DANGER)
-                    UI["conf_var"].set(f"Confidence {conf:.1%} < {IDENTIFY_THRESHOLD:.0%} threshold | {n_beats} beats")
+                    UI["conf_var"].set(f"Confidence {conf:.1%} < {IDENTIFY_THRESHOLD:.0%} threshold")
                     UI["scan_status"].set("Subject not recognized.")
                 else:
                     UI["result_var"].set(name.upper())
                     UI["result_lbl"].configure(fg=SUCCESS)
-                    UI["conf_var"].set(f"Confidence {conf:.1%} | {n_beats} beats analyzed")
+                    UI["conf_var"].set(f"Confidence {conf:.1%}")
                     UI["scan_status"].set(f"Identity confirmed – vault unlocked for {name}")
                     STATE["unlocked"].add(name)
                     refresh_gallery()
@@ -436,6 +424,7 @@ def flash_unlock(pid, n=6):
         UI["title_var"].set(f"▌ {pid.upper()} UNLOCKED ✓")
         STATE["root"].after(280, lambda: UI["title_var"].set("▌ ECG PERSONAL PHOTO LOCK"))
         STATE["root"].after(560, lambda: toggle(remaining - 1))
+
     toggle(n)
 
 
@@ -458,34 +447,25 @@ def build_ui(root):
     root.configure(bg=BG)
     root.geometry("1200x820")
     root.minsize(900, 700)
-
     os.makedirs(STATE["photos_dir"], exist_ok=True)
-
     hdr = tk.Frame(root, bg=BG, height=70)
     hdr.pack(fill="x")
     hdr.pack_propagate(False)
-
     UI["title_var"] = tk.StringVar(value="▌ ECG PERSONAL PHOTO LOCK")
     tk.Label(hdr, textvariable=UI["title_var"], bg=BG, fg=ACCENT, font=FNT_TITLE).pack(side="left", padx=28, pady=16)
-
     UI["mode_var"] = tk.StringVar(value="[ NO MODEL ]")
     UI["mode_lbl"] = tk.Label(hdr, textvariable=UI["mode_var"], bg=BG, fg=DANGER, font=FNT_MONO)
     UI["mode_lbl"].pack(side="right", padx=24)
-
     tk.Frame(root, bg=BORDER, height=1).pack(fill="x")
-
     body = tk.Frame(root, bg=BG)
     body.pack(fill="both", expand=True, padx=8, pady=8)
-
     left = tk.Frame(body, bg=PANEL, width=400)
     left.pack(side="left", fill="y", padx=(0, 6))
     left.pack_propagate(False)
     build_left(left)
-
     right = tk.Frame(body, bg=PANEL)
     right.pack(side="left", fill="both", expand=True)
     build_right(right)
-
     animate_cursor()
 
 
@@ -497,18 +477,14 @@ def build_left(parent):
     style.map("Dark.TNotebook.Tab", background=[("selected", CARD)], foreground=[("selected", ACCENT)])
     style.configure("ECG.Horizontal.TProgressbar", troughcolor=BORDER, background=ACCENT,
                     lightcolor=ACCENT, darkcolor=ACCENT2, bordercolor=PANEL)
-
     nb = ttk.Notebook(parent, style="Dark.TNotebook")
     nb.pack(fill="both", expand=True, padx=6, pady=6)
-
     tab_scan = tk.Frame(nb, bg=PANEL)
     nb.add(tab_scan, text=" SCANNER ")
     build_scanner_tab(tab_scan)
-
     tab_train = tk.Frame(nb, bg=PANEL)
     nb.add(tab_train, text=" TRAINING ")
     build_training_tab(tab_train)
-
     tab_res = tk.Frame(nb, bg=PANEL)
     nb.add(tab_res, text=" RESULTS ")
     build_results_tab(tab_res)
@@ -522,25 +498,20 @@ def build_scanner_tab(parent):
     ax.set_xlim(0, 3000)
     ax.set_ylim(-4, 4)
     ax.set_xlabel("Samples", fontsize=7)
-
     ecg_canvas = FigureCanvasTkAgg(fig, master=parent)
     ecg_canvas.get_tk_widget().pack(fill="x", padx=8, pady=(10, 4))
-
     UI["scan_fig"] = fig
     UI["scan_ax"] = ax
     UI["ecg_line"] = ecg_line
     UI["scan_fig_canvas"] = ecg_canvas
-
     progress = ttk.Progressbar(parent, orient="horizontal", length=370,
                                mode="determinate", style="ECG.Horizontal.TProgressbar")
     progress.pack(padx=12, pady=4)
     UI["progress"] = progress
-
     scan_status = tk.StringVar(value="Ready. Load an ECG CSV file to identify a subject.")
     UI["scan_status"] = scan_status
     tk.Label(parent, textvariable=scan_status, bg=PANEL, fg=TEXT_DIM,
              font=FNT_SMALL, wraplength=370, justify="center").pack(padx=8, pady=2)
-
     rf = tk.Frame(parent, bg=CARD, bd=1, relief="solid")
     rf.pack(fill="x", padx=12, pady=8)
     tk.Label(rf, text="IDENTIFICATION RESULT", bg=CARD, fg=TEXT_DIM, font=FNT_MONO).pack(pady=(8, 0))
@@ -562,7 +533,6 @@ def build_scanner_tab(parent):
 
     btn(parent, "[ LOAD ECG CSV ]", load_ecg_file)
     btn(parent, "[ LOCK ALL PHOTOS ]", lock_all, fg=DANGER)
-
     tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", padx=12, pady=8)
     tk.Label(parent, text="REGISTERED SUBJECTS:", bg=PANEL, fg=TEXT_DIM, font=FNT_MONO).pack(anchor="w", padx=14)
     subj_frame = tk.Frame(parent, bg=PANEL)
@@ -572,7 +542,6 @@ def build_scanner_tab(parent):
 
 
 def build_training_tab(parent):
-
     tk.Label(
         parent,
         text="TRAINING",
@@ -580,13 +549,7 @@ def build_training_tab(parent):
         fg=ACCENT,
         font=FNT_H2
     ).pack(anchor="w", padx=12, pady=(12, 2))
-
-    tk.Frame(parent, bg=BORDER, height=1).pack(
-        fill="x",
-        padx=12,
-        pady=6
-    )
-
+    tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", padx=12, pady=6)
     train_btn = tk.Button(
         parent,
         text="[ START TRAINING ]",
@@ -601,23 +564,9 @@ def build_training_tab(parent):
         pady=8,
         bd=0
     )
-
-    train_btn.pack(
-        fill="x",
-        padx=12,
-        pady=4
-    )
-
+    train_btn.pack(fill="x", padx=12, pady=4)
     UI["train_btn"] = train_btn
-
-    tk.Label(
-        parent,
-        text="TRAINING LOG",
-        bg=PANEL,
-        fg=TEXT_DIM,
-        font=FNT_MONO
-    ).pack(anchor="w", padx=12, pady=(8, 0))
-
+    tk.Label(parent, text="TRAINING LOG", bg=PANEL, fg=TEXT_DIM, font=FNT_MONO).pack(anchor="w", padx=12, pady=(8, 0))
     log_box = scrolledtext.ScrolledText(
         parent,
         bg="#0D1520",
@@ -629,26 +578,18 @@ def build_training_tab(parent):
         height=18,
         state="disabled"
     )
-
-    log_box.pack(
-        fill="both",
-        expand=True,
-        padx=10,
-        pady=(2, 8)
-    )
-
+    log_box.pack(fill="both",expand=True,padx=10,pady=(2, 8))
     UI["log_box"] = log_box
+
 
 def build_results_tab(parent):
     tk.Label(parent, text="ACCURACY TABLE", bg=PANEL, fg=ACCENT, font=FNT_H2).pack(anchor="w", padx=12, pady=(12, 4))
-
     style = ttk.Style()
     style.configure("Results.Treeview", background=CARD, fieldbackground=CARD, foreground=TEXT, rowheight=22,
                     font=("Courier New", 8))
     style.configure("Results.Treeview.Heading", background=BORDER, foreground=ACCENT,
                     font=("Courier New", 8, "bold"))
     style.map("Results.Treeview", background=[("selected", ACCENT2)])
-
     cols = ("Wavelet", "Classifier", "Parameters", "Accuracy (%)")
     results_tree = ttk.Treeview(parent, columns=cols, show="headings", style="Results.Treeview", height=14)
     for c in cols:
@@ -656,7 +597,6 @@ def build_results_tab(parent):
         results_tree.column(c, width=80 if c != "Parameters" else 100, anchor="center")
     results_tree.pack(fill="both", expand=True, padx=10, pady=2)
     UI["results_tree"] = results_tree
-
     best_var = tk.StringVar(value="Train a model to see results.")
     UI["best_var"] = best_var
     tk.Label(parent, textvariable=best_var, bg=PANEL, fg=WARN, font=FNT_MONO, wraplength=370).pack(padx=10, pady=6)
@@ -665,7 +605,6 @@ def build_results_tab(parent):
 def build_right(parent):
     tk.Label(parent, text="PHOTO VAULT", bg=PANEL, fg=ACCENT, font=FNT_H2).pack(anchor="w", padx=16, pady=(14, 4))
     tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", padx=10)
-
     canvas = tk.Canvas(parent, bg=PANEL, highlightthickness=0)
     vsb = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
     inner = tk.Frame(canvas, bg=PANEL)
@@ -674,7 +613,6 @@ def build_right(parent):
     canvas.configure(yscrollcommand=vsb.set)
     vsb.pack(side="right", fill="y")
     canvas.pack(side="left", fill="both", expand=True)
-
     UI["gallery_canvas"] = canvas
     UI["gallery_inner"] = inner
     refresh_gallery()
@@ -688,6 +626,7 @@ def main():
     root = tk.Tk()
     build_ui(root)
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()
