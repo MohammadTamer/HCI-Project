@@ -35,6 +35,7 @@ MODEL_STATE = {
 
 
 # file processing
+
 def load_csv_signal(file_path):
     return pd.read_csv(file_path).iloc[:, 0].to_numpy(dtype=float)
 
@@ -61,7 +62,9 @@ def load_dataset(data_root, subject_ids, fs=FS, log_fn=print):
     return np.vstack(X_list), np.array(y_list)
 
 
-def bandpass_filter(sig, lowcut=0.5, highcut=40, fs=FS, order=4):
+# data cleaning and beats extraction
+
+def bandpass_filter(sig, lowcut=0.5, highcut=40, fs=FS, order=2):
     nyq = fs / 2.0
     low = lowcut / nyq
     high = highcut / nyq
@@ -81,11 +84,24 @@ def detect_rpeaks(sig, fs=FS):
     diff = np.diff(sig, prepend=sig[0])
     squared = diff ** 2
     win = max(1, int(0.15 * fs))
-    integrated = np.convolve(squared, np.ones(win) / win, mode="same")
+    integrated = np.convolve(squared, np.ones(win) / win)
     threshold = np.mean(integrated) + 0.5 * np.std(integrated)
     peaks, _ = find_peaks(integrated, height=threshold, distance=int(0.3 * fs))
     return peaks.astype(int)
 
+
+def extract_heartbeats(sig, fs=FS):
+    r_peaks = detect_rpeaks(sig, fs=fs)
+    beats = []
+    for r in r_peaks:
+        start = r - SEG_BEFORE
+        end = r + SEG_AFTER
+        if start >= 0 and end <= len(sig):
+            beats.append(sig[start:end])
+    return np.asarray(beats)
+
+
+# feature extraction
 
 def fiducial_features(segment, fs=FS):
     r_peaks = detect_rpeaks(segment, fs)
@@ -130,30 +146,14 @@ def non_fiducial_features(segment, wavelet, level=WAVELET_LEVEL):
     ])
 
 
-def extract_heartbeats(sig, fs=FS):
-    r_peaks = detect_rpeaks(sig, fs=fs)
-    beats = []
-    for r in r_peaks:
-        start = r - SEG_BEFORE
-        end = r + SEG_AFTER
-        if start >= 0 and end <= len(sig):
-            beats.append(sig[start:end])
-    return np.asarray(beats)
-
-
-# feature extraction
-
-def combined_features(segment, wavelet):
-    fid_feats = fiducial_features(segment)
-    nonfid_feats = non_fiducial_features(segment, wavelet=wavelet)
-    return np.concatenate([
-        fid_feats,
-        nonfid_feats
-    ])
-
-
 def extract_features(X, wavelet):
-    return np.asarray([combined_features(x, wavelet=wavelet) for x in X])
+    features = []
+    for segment in X:
+        fid_feats = fiducial_features(segment)
+        nonfid_feats = non_fiducial_features(segment, wavelet=wavelet)
+        combined = np.concatenate([fid_feats, nonfid_feats])
+        features.append(combined)
+    return np.asarray(features)
 
 
 def extract_all_wavelets(X, log_fn=print):
@@ -166,7 +166,7 @@ def extract_all_wavelets(X, log_fn=print):
     return out
 
 
-# classification
+# training
 
 def get_classifiers():
     return {
@@ -214,8 +214,6 @@ def train_evaluate_all(X, y, log_fn=print):
     return results
 
 
-# train
-
 def run_full_training(data_root, subject_ids, fs=FS, log_fn=print):
     log_fn("[1/4] Loading dataset")
     X, y = load_dataset(data_root, subject_ids, fs=fs, log_fn=log_fn)
@@ -257,6 +255,8 @@ def run_full_training(data_root, subject_ids, fs=FS, log_fn=print):
     log_fn("[4/4] Training finished")
     return df
 
+
+# prediction
 
 def predict_subject_from_file(csv_path, fs=FS):
     sig = load_csv_signal(csv_path)
